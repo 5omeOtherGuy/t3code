@@ -23,7 +23,8 @@ import {
   UserRoundIcon,
   type LucideIcon,
 } from "lucide-react";
-import { memo, useLayoutEffect, useRef } from "react";
+import { memo, type ReactNode, useLayoutEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 import { type ComposerSlashCommand, type ComposerTriggerKind } from "../../composer-logic";
 import { cn } from "~/lib/utils";
@@ -90,6 +91,21 @@ export type ComposerCommandItem =
       description: string;
     };
 
+// The rem height of CommandList's max-h-72.
+const LIST_MAX_HEIGHT_REM = 18;
+const SCROLL_STEP_PX = 60;
+// Keyboard scrolling flushes rows in the frame it moves, so it needs only the list padding.
+const KEYBOARD_OVERSCAN_PX = 30;
+// Wheel, touch and scrollbar scrolling can paint on the compositor before rows mount.
+const POINTER_OVERSCAN_PX = 240;
+const ROW_SLOTS = 64;
+
+type RowKind = "plain" | "badged";
+const DEFAULT_ROW_HEIGHTS: Record<RowKind, number> = { plain: 28, badged: 30 };
+
+const rowKindOf = (item: ComposerCommandItem): RowKind =>
+  item.type === "skill" ? "badged" : "plain";
+
 export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
   listId: string;
   items: ComposerCommandItem[];
@@ -133,20 +149,15 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
             aria-label={props.triggerKind ? LISTBOX_LABEL_BY_TRIGGER[props.triggerKind] : undefined}
             className="max-h-72 min-h-0 scroll-pb-6"
           >
-            <CommandGroup>
-              {props.items.map((item) => (
-                <ComposerCommandMenuItem
-                  key={item.id}
-                  optionId={composerSuggestionOptionId(props.listId, item.id)}
-                  item={item}
-                  triggerKind={props.triggerKind}
-                  resolvedTheme={props.resolvedTheme}
-                  isActive={props.activeItemId === item.id}
-                  onHighlight={props.onHighlightedItemChange}
-                  onSelect={props.onSelect}
-                />
-              ))}
-            </CommandGroup>
+            <ComposerCommandMenuRows
+              listId={props.listId}
+              items={props.items}
+              resolvedTheme={props.resolvedTheme}
+              triggerKind={props.triggerKind}
+              activeItemId={props.activeItemId}
+              onHighlightedItemChange={props.onHighlightedItemChange}
+              onSelect={props.onSelect}
+            />
           </CommandList>
         ) : (
           <div className="px-5 pt-3.5 pb-7">
@@ -171,7 +182,131 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
   );
 });
 
+function ComposerCommandMenuRows(props: {
+  listId: string;
+  items: ComposerCommandItem[];
+  resolvedTheme: "light" | "dark";
+  triggerKind: ComposerTriggerKind | null;
+  activeItemId: string | null;
+  onHighlightedItemChange: (itemId: string | null) => void;
+  onSelect: (item: ComposerCommandItem) => void;
+}) {
+  const groupRef = useRef<HTMLDivElement>(null);
+  const [scrollStep, setScrollStep] = useState(0);
+  const [pointerOverList, setPointerOverList] = useState(false);
+  const [rowHeights, setRowHeights] = useState(DEFAULT_ROW_HEIGHTS);
+  const [viewportHeight] = useState(
+    () =>
+      LIST_MAX_HEIGHT_REM *
+      (Number.parseFloat(window.getComputedStyle(document.documentElement).fontSize) || 16),
+  );
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes to the ScrollArea viewport, and flushes so rows are mounted in the frame that scrolls to them
+  useLayoutEffect(() => {
+    const viewport = groupRef.current?.closest("[data-slot=scroll-area-viewport]");
+    const scrollArea = viewport?.parentElement;
+    if (!viewport || !scrollArea) return;
+    const onScroll = () => {
+      flushSync(() => setScrollStep(Math.floor(viewport.scrollTop / SCROLL_STEP_PX)));
+    };
+    const onPointerEnter = () => setPointerOverList(true);
+    viewport.addEventListener("scroll", onScroll, { passive: true });
+    scrollArea.addEventListener("pointerenter", onPointerEnter, { once: true });
+    return () => {
+      viewport.removeEventListener("scroll", onScroll);
+      scrollArea.removeEventListener("pointerenter", onPointerEnter);
+    };
+  }, []);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reads rendered row heights so the spacers match them at any viewport width or font size
+  useLayoutEffect(() => {
+    const heightOf = (kind: RowKind) =>
+      groupRef.current?.querySelector(`[data-composer-row-kind=${kind}]`)?.getBoundingClientRect()
+        .height ?? rowHeights[kind];
+    const measured = { plain: heightOf("plain"), badged: heightOf("badged") };
+    if (measured.plain !== rowHeights.plain || measured.badged !== rowHeights.badged) {
+      setRowHeights(measured);
+    }
+  });
+
+  return (
+    <CommandGroup ref={groupRef}>
+      {renderWindowedRows({
+        items: props.items,
+        rowHeights,
+        scrollTop: scrollStep * SCROLL_STEP_PX,
+        viewportHeight,
+        overscan: pointerOverList ? POINTER_OVERSCAN_PX : KEYBOARD_OVERSCAN_PX,
+        activeItemId: props.activeItemId,
+        renderRow: (item, index, slot) => (
+          <ComposerCommandMenuItem
+            key={slot}
+            index={index}
+            itemCount={props.items.length}
+            optionId={composerSuggestionOptionId(props.listId, item.id)}
+            item={item}
+            triggerKind={props.triggerKind}
+            resolvedTheme={props.resolvedTheme}
+            isActive={props.activeItemId === item.id}
+            onHighlight={props.onHighlightedItemChange}
+            onSelect={props.onSelect}
+          />
+        ),
+      })}
+    </CommandGroup>
+  );
+}
+
+/**
+ * Mounts the rows near the viewport and the active row, which stays mounted so
+ * aria-activedescendant and scrollIntoView always find it. Equal-height spacers
+ * replace the rest, so scroll range and row positions match a full list.
+ */
+function renderWindowedRows(input: {
+  readonly items: ReadonlyArray<ComposerCommandItem>;
+  readonly rowHeights: Record<RowKind, number>;
+  readonly scrollTop: number;
+  readonly viewportHeight: number;
+  readonly overscan: number;
+  readonly activeItemId: string | null;
+  readonly renderRow: (item: ComposerCommandItem, index: number, slot: string) => ReactNode;
+}): ReactNode[] {
+  const { items, rowHeights, scrollTop, viewportHeight, overscan, activeItemId, renderRow } = input;
+  const windowTop = scrollTop - overscan;
+  const windowBottom = scrollTop + SCROLL_STEP_PX + viewportHeight + overscan;
+  const rendered: ReactNode[] = [];
+  let spacerHeight = 0;
+  let spacerStart = 0;
+  let offset = 0;
+  items.forEach((item, index) => {
+    const height = rowHeights[rowKindOf(item)];
+    const inWindow = offset + height > windowTop && offset < windowBottom;
+    offset += height;
+    if (!inWindow && item.id !== activeItemId) {
+      spacerHeight += height;
+      return;
+    }
+    if (spacerHeight > 0) {
+      rendered.push(
+        <div aria-hidden="true" key={`spacer:${spacerStart}`} style={{ height: spacerHeight }} />,
+      );
+    }
+    // Slots reuse row elements across filtering and scrolling instead of replacing them.
+    rendered.push(renderRow(item, index, inWindow ? `row:${index % ROW_SLOTS}` : "active"));
+    spacerHeight = 0;
+    spacerStart = index + 1;
+  });
+  if (spacerHeight > 0) {
+    rendered.push(
+      <div aria-hidden="true" key={`spacer:${spacerStart}`} style={{ height: spacerHeight }} />,
+    );
+  }
+  return rendered;
+}
+
 const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
+  index: number;
+  itemCount: number;
   optionId: string;
   item: ComposerCommandItem;
   triggerKind: ComposerTriggerKind | null;
@@ -190,9 +325,12 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
   return (
     <CommandItem
       render={<div id={props.optionId} />}
+      aria-posinset={props.index + 1}
+      aria-setsize={props.itemCount}
       aria-selected={props.isActive}
       value={props.item.id}
       data-composer-item-id={props.item.id}
+      data-composer-row-kind={rowKindOf(props.item)}
       active={props.isActive}
       onMouseMove={() => {
         if (!props.isActive) props.onHighlight(props.item.id);
